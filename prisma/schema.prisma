@@ -1,0 +1,248 @@
+// Agendo — SaaS de prise de rendez-vous synchronisé avec Google Calendar.
+// Heures stockées en UTC ; le fuseau du professionnel est dans User.timezone.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Authentification (tables gérées par Better Auth) ───────────────────────
+
+model User {
+  id            String   @id
+  name          String
+  email         String   @unique
+  emailVerified Boolean  @default(false)
+  image         String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  /// Identifiant public de la page de réservation : /book/<slug>
+  slug         String? @unique
+  businessName String?
+  /// Fuseau IANA, ex. "Europe/Paris", "Africa/Abidjan"
+  timezone     String  @default("Europe/Paris")
+  phone        String?
+  /// Calendrier Google cible ("primary" par défaut)
+  calendarId   String  @default("primary")
+  /// Délai minimum avant un créneau réservable (minutes)
+  minNoticeMin Int     @default(120)
+  /// Fenêtre de réservation (jours)
+  maxDaysAhead Int     @default(60)
+
+  sessions      Session[]
+  accounts      Account[]
+  services      Service[]
+  availability  Availability[]
+  bookings      Booking[]
+  notifications Notification[]
+  preferences   NotificationPreference?
+
+  @@map("user")
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([userId])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verification")
+}
+
+// ─── Métier ────────────────────────────────────────────────────────────────
+
+model Service {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  durationMin Int      @default(30)
+  /// Temps tampon après le rendez-vous (minutes)
+  bufferMin   Int      @default(0)
+  /// Prix en plus petite unité de la devise (centimes), null = gratuit / non affiché
+  priceCents  Int?
+  currency    String   @default("EUR")
+  color       String   @default("#1d4ed8")
+  /// Lieu : adresse, "Google Meet" ou téléphone
+  location    String?
+  /// Ajoute automatiquement un lien Google Meet à l'événement
+  withMeet    Boolean  @default(false)
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  bookings Booking[]
+
+  @@index([userId])
+}
+
+/// Plage d'ouverture hebdomadaire (heure locale du professionnel)
+model Availability {
+  id       String @id @default(cuid())
+  userId   String
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// 0 = dimanche … 6 = samedi
+  weekday  Int
+  /// Minutes depuis minuit, ex. 9h00 = 540
+  startMin Int
+  endMin   Int
+
+  @@index([userId, weekday])
+}
+
+enum BookingStatus {
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
+}
+
+model Booking {
+  id            String        @id @default(cuid())
+  userId        String
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  serviceId     String
+  service       Service       @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+  clientName    String
+  clientEmail   String
+  clientPhone   String?
+  notes         String?
+  startAt       DateTime
+  endAt         DateTime
+  status        BookingStatus @default(CONFIRMED)
+  cancelReason  String?
+  cancelledBy   String?
+  /// Jeton secret pour que le client annule sans compte
+  manageToken   String        @unique @default(cuid())
+  googleEventId String?
+  meetUrl       String?
+  /// Rappels déjà envoyés
+  reminder24hAt DateTime?
+  reminder1hAt  DateTime?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  notifications Notification[]
+  deliveries    NotificationDelivery[]
+
+  @@index([userId, startAt])
+  @@index([status, startAt])
+}
+
+// ─── Notifications & alertes ───────────────────────────────────────────────
+
+enum NotificationType {
+  BOOKING_CREATED
+  BOOKING_CANCELLED
+  BOOKING_REMINDER
+  CALENDAR_SYNC_ERROR
+  DELIVERY_FAILED
+}
+
+/// Notification in-app (cloche) du professionnel
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  title     String
+  body      String
+  bookingId String?
+  booking   Booking?         @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  @@index([userId, readAt, createdAt])
+}
+
+model NotificationPreference {
+  userId String @id
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Canaux vers le client
+  clientEmail    Boolean @default(true)
+  clientSms      Boolean @default(false)
+  clientWhatsapp Boolean @default(false)
+
+  // Alertes vers le professionnel
+  hostEmail    Boolean @default(true)
+  hostSms      Boolean @default(false)
+  hostWhatsapp Boolean @default(false)
+
+  // Rappels automatiques au client
+  remind24h Boolean @default(true)
+  remind1h  Boolean @default(true)
+
+  updatedAt DateTime @updatedAt
+}
+
+enum Channel {
+  EMAIL
+  SMS
+  WHATSAPP
+}
+
+enum DeliveryStatus {
+  SENT
+  FAILED
+  SKIPPED
+}
+
+/// Journal des envois (email / SMS / WhatsApp) — utile pour diagnostiquer
+model NotificationDelivery {
+  id        String         @id @default(cuid())
+  bookingId String?
+  booking   Booking?       @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  channel   Channel
+  recipient String
+  template  String
+  status    DeliveryStatus
+  error     String?
+  createdAt DateTime       @default(now())
+
+  @@index([bookingId])
+}
